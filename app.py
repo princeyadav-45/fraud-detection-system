@@ -20,7 +20,7 @@ load_dotenv(BASE_DIR / ".env")
 DATA_FILE = BASE_DIR / "data" / "processed_transactions.jsonl"
 API_URL = os.getenv(
     "FRAUDSHIELD_API_URL",
-    "http://127.0.0.1:8001",
+   https://fraud-detection-system-rg0j.onrender.com,
 ).rstrip("/")
 
 ADMIN_USERNAME = os.getenv("FRAUDSHIELD_ADMIN_USER", "")
