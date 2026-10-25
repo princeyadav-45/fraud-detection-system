@@ -1,6 +1,9 @@
+from dotenv import load_dotenv
 
+load_dotenv()
 from pathlib import Path
 import json
+import os
 import sys
 import uuid
 from datetime import datetime, timezone
@@ -19,7 +22,11 @@ if str(BASE_DIR) not in sys.path:
 
 from fraud_detector import predict_transaction
 
-BOOTSTRAP_SERVERS = "localhost:9092"
+KAFKA_HOST = os.getenv("KAFKA_HOST")
+KAFKA_PORT = os.getenv("KAFKA_PORT", "15182")
+KAFKA_USERNAME = os.getenv("KAFKA_USERNAME")
+KAFKA_PASSWORD = os.getenv("KAFKA_PASSWORD")
+
 TRANSACTIONS_TOPIC = "transactions"
 
 app = FastAPI(
@@ -43,9 +50,32 @@ def get_kafka_producer():
     global kafka_producer
 
     if kafka_producer is None:
+        required = {
+            "KAFKA_HOST": KAFKA_HOST,
+            "KAFKA_USERNAME": KAFKA_USERNAME,
+            "KAFKA_PASSWORD": KAFKA_PASSWORD,
+        }
+        missing = [
+            name for name, value in required.items()
+            if not value
+        ]
+
+        if missing:
+            raise RuntimeError(
+                "Missing Kafka environment variables: "
+                + ", ".join(missing)
+            )
+
         kafka_producer = KafkaProducer(
-            bootstrap_servers=BOOTSTRAP_SERVERS,
-            value_serializer=lambda value: json.dumps(value).encode("utf-8"),
+            bootstrap_servers=f"{KAFKA_HOST}:{KAFKA_PORT}",
+            security_protocol="SASL_SSL",
+            ssl_cafile=str(BASE_DIR / "ca.pem"),
+            sasl_mechanism="PLAIN",
+            sasl_plain_username=KAFKA_USERNAME,
+            sasl_plain_password=KAFKA_PASSWORD,
+            value_serializer=lambda value: json.dumps(
+                value
+            ).encode("utf-8"),
             key_serializer=lambda key: key.encode("utf-8"),
         )
 
@@ -56,10 +86,16 @@ class TransactionRequest(BaseModel):
     amount: float = Field(gt=0, le=100000000)
     merchant: str = Field(min_length=1, max_length=100)
     location: str = Field(min_length=1, max_length=100)
-    user_id: str = Field(default="DEMO-USER", min_length=1, max_length=100)
+    user_id: str = Field(
+        default="DEMO-USER",
+        min_length=1,
+        max_length=100,
+    )
 
 
 def find_processed_transaction(transaction_id: str):
+    # Temporary local storage only.
+    # Replace with shared database access for cloud deployment.
     if not DATA_FILE.exists():
         return None
 
@@ -95,12 +131,12 @@ def health():
     return {
         "status": "healthy" if model_path.exists() else "model_missing",
         "model_file_exists": model_path.exists(),
-        "kafka_configured": True,
+        "kafka_configured": bool(
+            KAFKA_HOST and KAFKA_USERNAME and KAFKA_PASSWORD
+        ),
     }
 
 
-# Existing synchronous prediction endpoint.
-# Kept for compatibility with the current dashboard.
 @app.post("/predict")
 def predict(request: TransactionRequest):
     transaction = {
@@ -112,10 +148,14 @@ def predict(request: TransactionRequest):
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
-    if not transaction["merchant"] or not transaction["location"]:
+    if (
+        not transaction["user_id"]
+        or not transaction["merchant"]
+        or not transaction["location"]
+    ):
         raise HTTPException(
             status_code=422,
-            detail="Merchant and location cannot be empty.",
+            detail="User ID, merchant and location cannot be empty.",
         )
 
     try:
@@ -145,7 +185,6 @@ def predict(request: TransactionRequest):
         ) from exc
 
 
-# New asynchronous submission endpoint.
 @app.post("/transactions", status_code=202)
 def submit_transaction(request: TransactionRequest):
     merchant = request.merchant.strip()
@@ -181,17 +220,16 @@ def submit_transaction(request: TransactionRequest):
             "message": "Transaction accepted for risk analysis.",
         }
 
-    except (KafkaError, OSError, TimeoutError, Exception) as exc:
+    except Exception as exc:
         raise HTTPException(
             status_code=503,
             detail=(
                 "Could not submit transaction to Kafka. "
-                f"Check that Kafka is running. Error: {exc}"
+                "Check Kafka settings and service availability."
             ),
         ) from exc
 
 
-# Poll this endpoint until the consumer saves the prediction.
 @app.get("/transactions/{transaction_id}")
 def get_transaction_status(transaction_id: str):
     result = find_processed_transaction(transaction_id)
@@ -200,7 +238,9 @@ def get_transaction_status(transaction_id: str):
         return {
             "transaction_id": transaction_id,
             "processing_status": "PROCESSING",
-            "message": "Waiting for the Kafka consumer to process this transaction.",
+            "message": (
+                "Waiting for the Kafka consumer to process this transaction."
+            ),
         }
 
     status = str(result.get("status", "UNKNOWN")).upper()
